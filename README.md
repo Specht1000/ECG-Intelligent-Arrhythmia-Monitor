@@ -35,6 +35,6 @@ MIT-BIH Arrhythmia Database
 
 ## Author
 
-Guilherme Martins Specht
-PUCRS / Polytech Montpellier
-Computer Engineering / Microelectronics
+- Guilherme Martins Specht
+- PUCRS / Polytech Montpellier
+- Computer Engineering / Microelectronics
