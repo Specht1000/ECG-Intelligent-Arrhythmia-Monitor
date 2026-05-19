@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+.venv-cnn/
+
+# PlatformIO
+.pio/
+
+# VSCode
+.vscode/
+
+# Large datasets
+*.npy
+*.npz
+*.h5
+
+# Logs
+*.log
+
+# CSV temporários
+tools/ecg_raw_capture.csv
+
+# TensorFlow cache
+.keras/
+
+# Data
+data/
+
+# Windows
+Thumbs.db
+desktop.ini
