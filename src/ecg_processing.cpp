@@ -1,16 +1,22 @@
 #include "ecg_processing.h"
 #include "main.h"
 
-static float prev_raw = 0.0f;
-static float dc_estimate = 0.0f;
-
+static float prev_sample = 0.0f;
 static float derivative_prev = 0.0f;
+
+/*
+ * Suavização extra antes da derivada.
+ * Ajuda a reduzir ruído rápido do AD8232/ADS1115.
+ */
+static float lowpass_prev = 0.0f;
 
 static float mwi_buffer[ECG_MWI_SIZE];
 static int mwi_index = 0;
 static float mwi_sum = 0.0f;
 
-static float threshold = 1000.0f;
+static float spki = 0.0f;
+static float npki = 0.0f;
+static float threshold_i = 0.0f;
 
 static unsigned long last_peak_ms = 0;
 
@@ -22,9 +28,9 @@ static float bpm_current = 0.0f;
 
 void ecg_processing_init(void)
 {
-    prev_raw = 0.0f;
-    dc_estimate = 0.0f;
+    prev_sample = 0.0f;
     derivative_prev = 0.0f;
+    lowpass_prev = 0.0f;
 
     for (int i = 0; i < ECG_MWI_SIZE; i++) {
         mwi_buffer[i] = 0.0f;
@@ -36,13 +42,18 @@ void ecg_processing_init(void)
 
     mwi_index = 0;
     mwi_sum = 0.0f;
-    threshold = 1000.0f;
+
+    spki = 0.0f;
+    npki = 0.0f;
+    threshold_i = 80.0f;
+
     last_peak_ms = 0;
+
     rr_index = 0;
     rr_count = 0;
     bpm_current = 0.0f;
 
-    LOG("ECG", "Pan-Tompkins simplificado inicializado");
+    LOG("ECG", "Pan-Tompkins adaptativo inicializado");
 }
 
 static float update_rr_and_bpm(unsigned long now_ms)
@@ -55,7 +66,7 @@ static float update_rr_and_bpm(unsigned long now_ms)
     float rr_sec = (now_ms - last_peak_ms) / 1000.0f;
     last_peak_ms = now_ms;
 
-    if (rr_sec < 0.3f || rr_sec > 2.0f) {
+    if (rr_sec < 0.45f || rr_sec > 1.50f) {
         return 0.0f;
     }
 
@@ -81,41 +92,47 @@ static float update_rr_and_bpm(unsigned long now_ms)
     return rr_sec;
 }
 
-ecg_output_t ecg_processing_update(int raw_sample)
+ecg_output_t ecg_processing_update(int sample)
 {
     ecg_output_t out = {};
-    out.raw = raw_sample;
+
+    out.raw = sample;
+    out.filtered = (float)sample;
     out.r_peak_detected = false;
     out.bpm = bpm_current;
     out.rr_sec = 0.0f;
 
-    float x = (float)raw_sample;
+    float x = (float)sample;
 
     /*
-     * 1) Remoção lenta de baseline/DC
+     * 0) Low-pass simples antes da derivada.
+     * Quanto maior o primeiro coeficiente, mais suave fica.
      */
-    dc_estimate = 0.995f * dc_estimate + 0.005f * x;
-    float centered = x - dc_estimate;
+    x = 0.85f * lowpass_prev + 0.15f * x;
+    lowpass_prev = x;
+
+    out.filtered = x;
 
     /*
-     * 2) Derivada simples
+     * 1) Derivada
      */
-    float derivative = centered - prev_raw;
-    prev_raw = centered;
+    float derivative = x - prev_sample;
+    prev_sample = x;
 
     /*
-     * 3) Suavização leve da derivada
+     * 2) Suavização da derivada.
+     * Mais suave para reduzir falsos picos por ruído rápido.
      */
-    derivative = 0.7f * derivative_prev + 0.3f * derivative;
+    derivative = 0.92f * derivative_prev + 0.08f * derivative;
     derivative_prev = derivative;
 
     /*
-     * 4) Quadrado
+     * 3) Quadrado
      */
     float squared = derivative * derivative;
 
     /*
-     * 5) Moving Window Integration
+     * 4) Moving Window Integration
      */
     mwi_sum -= mwi_buffer[mwi_index];
     mwi_buffer[mwi_index] = squared;
@@ -124,26 +141,32 @@ ecg_output_t ecg_processing_update(int raw_sample)
     mwi_index = (mwi_index + 1) % ECG_MWI_SIZE;
 
     float integrated = mwi_sum / ECG_MWI_SIZE;
+    out.integrated = integrated;
 
     /*
-     * 6) Threshold adaptativo simples
+     * 5) Threshold adaptativo
      */
-    threshold = 0.995f * threshold + 0.005f * integrated;
-
-    float dynamic_threshold = threshold * 3.0f;
+    threshold_i = npki + 0.25f * (spki - npki);
+    out.threshold = threshold_i;
 
     unsigned long now_ms = millis();
 
-    if (integrated > dynamic_threshold &&
-        (now_ms - last_peak_ms) > ECG_REFRACTORY_MS) {
+    bool refractory_ok = (now_ms - last_peak_ms) > ECG_REFRACTORY_MS;
+
+    bool is_peak =
+        integrated > (threshold_i * 1.25f) &&
+        derivative > 5.0f &&
+        refractory_ok;
+
+    if (is_peak) {
+        spki = 0.125f * integrated + 0.875f * spki;
 
         out.r_peak_detected = true;
         out.rr_sec = update_rr_and_bpm(now_ms);
         out.bpm = bpm_current;
+    } else {
+        npki = 0.125f * integrated + 0.875f * npki;
     }
-
-    out.filtered = centered;
-    out.integrated = integrated;
 
     return out;
 }

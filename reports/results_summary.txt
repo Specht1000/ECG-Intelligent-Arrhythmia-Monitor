@@ -1,0 +1,43 @@
+
+RESULTADOS DO SISTEMA ECG + IA
+
+1. Dataset utilizado
+Total de batimentos: 100610
+
+Distribuição das classes:
+normal              90594
+ventricular          7235
+supraventricular     2781
+
+2. Modelo
+Modelo utilizado: CNN 1D
+Entrada: batimentos segmentados com 252 amostras
+Classes: normal, supraventricular, ventricular
+
+3. Desempenho geral
+Accuracy: 0.9953
+
+4. Métricas por classe
+                  precision    recall  f1-score   support
+
+          normal       1.00      1.00      1.00     90594
+supraventricular       0.98      0.88      0.93      2781
+     ventricular       0.99      0.99      0.99      7235
+
+        accuracy                           1.00    100610
+       macro avg       0.99      0.96      0.97    100610
+    weighted avg       1.00      1.00      1.00    100610
+
+
+5. Observações técnicas
+O sistema apresentou alto desempenho na classificação de batimentos do banco MIT-BIH.
+A classe ventricular apresentou excelente desempenho, sendo a mais relevante para alerta clínico.
+A classe supraventricular apresentou menor recall, o que é esperado, pois pode apresentar morfologia semelhante à classe normal.
+
+6. Resultados experimentais do protótipo
+O sistema também foi testado com sinais reais adquiridos por AD8232 + ADS1115 + ESP32-S3.
+Os sinais reais apresentaram ruídos e artefatos típicos de sensores de baixo custo, como interferência muscular, movimentação dos eletrodos e variação de linha de base.
+Por isso, foi implementado um classificador de qualidade do sinal para indicar quando a leitura é boa, aceitável ou ruim.
+
+7. Conclusão parcial
+O sistema desenvolvido demonstrou viabilidade técnica para aquisição, processamento, detecção de picos R, estimativa de BPM, classificação de batimentos e emissão de alertas em tempo real.

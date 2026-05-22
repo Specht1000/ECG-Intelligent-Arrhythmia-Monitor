@@ -1,18 +1,359 @@
 #include "main.h"
-#include "ad8232.h"
-#include "ecg_processing.h"
 
-static unsigned long last_sample_us = 0;
+#include "ads1115_ecg.h"
+#include "ecg_processing.h"
+#include "ecg_filter.h"
+#include "sh1106_oled.h"
+
+#define ECG_TASK_STACK_SIZE 8192
+#define ECG_TASK_PRIORITY   2
+
+#define ECG_LO_PLUS_PIN     4
+#define ECG_LO_MINUS_PIN    5
+
+#define LEADS_OFF_COUNT_LIMIT 8
+#define BPM_HISTORY_SIZE 8
+
+typedef enum {
+    STREAM_MODE_LOG = 0,
+    STREAM_MODE_DATA = 1
+} stream_mode_t;
+
+static stream_mode_t stream_mode = STREAM_MODE_LOG;
+
+static sh1106_t oled;
+static bool oled_ok = false;
+
+static unsigned long last_debug_ms = 0;
+static unsigned long last_oled_ms = 0;
+
+static float g_bpm = 0.0f;
+static float g_bpm_smoothed = 0.0f;
+static bool g_bpm_initialized = false;
+
+static char g_status[32] = "STARTING";
+
+static int leads_off_counter = 0;
+
+static float bpm_history[BPM_HISTORY_SIZE];
+static int bpm_hist_index = 0;
+static int bpm_hist_count = 0;
+
+static bool ecg_leads_off_raw()
+{
+    bool lo_plus = digitalRead(ECG_LO_PLUS_PIN) == HIGH;
+    bool lo_minus = digitalRead(ECG_LO_MINUS_PIN) == HIGH;
+
+    return lo_plus || lo_minus;
+}
+
+static bool ecg_leads_off_debounced()
+{
+    bool raw = ecg_leads_off_raw();
+
+    if (raw) {
+        if (leads_off_counter < LEADS_OFF_COUNT_LIMIT) {
+            leads_off_counter++;
+        }
+    } else {
+        if (leads_off_counter > 0) {
+            leads_off_counter--;
+        }
+    }
+
+    return leads_off_counter >= LEADS_OFF_COUNT_LIMIT;
+}
+
+static float median_bpm()
+{
+    if (bpm_hist_count == 0) {
+        return 0.0f;
+    }
+
+    float sorted[BPM_HISTORY_SIZE];
+
+    for (int i = 0; i < bpm_hist_count; i++) {
+        sorted[i] = bpm_history[i];
+    }
+
+    for (int i = 0; i < bpm_hist_count - 1; i++) {
+        for (int j = i + 1; j < bpm_hist_count; j++) {
+            if (sorted[j] < sorted[i]) {
+                float tmp = sorted[i];
+                sorted[i] = sorted[j];
+                sorted[j] = tmp;
+            }
+        }
+    }
+
+    return sorted[bpm_hist_count / 2];
+}
+
+static float smooth_bpm(float bpm)
+{
+    if (bpm < 35.0f || bpm > 180.0f) {
+        return g_bpm_smoothed;
+    }
+
+    bpm_history[bpm_hist_index] = bpm;
+    bpm_hist_index = (bpm_hist_index + 1) % BPM_HISTORY_SIZE;
+
+    if (bpm_hist_count < BPM_HISTORY_SIZE) {
+        bpm_hist_count++;
+    }
+
+    float bpm_med = median_bpm();
+
+    if (!g_bpm_initialized) {
+        g_bpm_smoothed = bpm_med;
+        g_bpm_initialized = true;
+        return g_bpm_smoothed;
+    }
+
+    float max_step = 1.5f;
+    float diff = bpm_med - g_bpm_smoothed;
+
+    if (diff > max_step) {
+        diff = max_step;
+    }
+
+    if (diff < -max_step) {
+        diff = -max_step;
+    }
+
+    g_bpm_smoothed = g_bpm_smoothed + 0.15f * diff;
+
+    return g_bpm_smoothed;
+}
+
+static void reset_bpm_filter()
+{
+    g_bpm = 0.0f;
+    g_bpm_smoothed = 0.0f;
+    g_bpm_initialized = false;
+
+    bpm_hist_index = 0;
+    bpm_hist_count = 0;
+
+    for (int i = 0; i < BPM_HISTORY_SIZE; i++) {
+        bpm_history[i] = 0.0f;
+    }
+}
+
+static void update_status_from_bpm(float bpm)
+{
+    if (bpm <= 0.0f) {
+        snprintf(g_status, sizeof(g_status), "WAITING");
+    } else if (bpm < 50.0f) {
+        snprintf(g_status, sizeof(g_status), "LOW_HR");
+    } else if (bpm > 120.0f) {
+        snprintf(g_status, sizeof(g_status), "HIGH_HR");
+    } else {
+        snprintf(g_status, sizeof(g_status), "NORMAL");
+    }
+}
+
+static void handle_serial_commands()
+{
+    while (Serial.available()) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+
+        if (cmd == "MODE_AI" || cmd == "STREAM_ON" || cmd == "DATA") {
+            stream_mode = STREAM_MODE_DATA;
+            LOG("SERIAL", "Mode AI: DATA stream ON");
+            return;
+        }
+
+        if (cmd == "MODE_DOCTOR" || cmd == "STREAM_OFF" || cmd == "LOG") {
+            stream_mode = STREAM_MODE_LOG;
+            LOG("SERIAL", "Mode Doctor: LOG stream ON");
+            return;
+        }
+    }
+}
+
+static void updateOLED()
+{
+    if (!oled_ok) {
+        return;
+    }
+
+    sh1106_clear(&oled);
+
+    char line[64];
+
+    sh1106_draw_text_line(&oled, 0, "PFE ECG MONITOR");
+
+    snprintf(line, sizeof(line), "BPM: %.1f", g_bpm);
+    sh1106_draw_text_line(&oled, 2, line);
+
+    sh1106_draw_text_line(&oled, 4, "STATUS:");
+
+    snprintf(line, sizeof(line), "%s", g_status);
+    sh1106_draw_text_line(&oled, 5, line);
+
+    sh1106_refresh(&oled);
+}
+
+static void ecgTask(void *pvParameters)
+{
+    unsigned long last_sample_us = micros();
+
+    while (true) {
+        handle_serial_commands();
+
+        unsigned long now_us = micros();
+
+        if ((now_us - last_sample_us) >= SAMPLE_INTERVAL_US) {
+            last_sample_us += SAMPLE_INTERVAL_US;
+
+            startTaskTimer(TASK_AD8232_READ);
+            int16_t raw = ads1115_ecg_read_raw();
+            endTaskTimer(TASK_AD8232_READ);
+
+            bool leads_off = ecg_leads_off_debounced();
+
+            if (leads_off) {
+                reset_bpm_filter();
+                snprintf(g_status, sizeof(g_status), "LEADS_OFF");
+
+                if (stream_mode == STREAM_MODE_DATA) {
+                    Serial.printf(
+                        "DATA,%lu,%d,0.00,0.00,0,0.0,0.00,%s\n",
+                        now_us,
+                        raw,
+                        g_status
+                    );
+                }
+
+                unsigned long now_ms = millis();
+
+                if ((now_ms - last_debug_ms) >= 1000) {
+                    last_debug_ms = now_ms;
+
+                    LOG(
+                        "ECG",
+                        "LEADS_OFF | RAW=%d | BPM=0.0",
+                        raw
+                    );
+                }
+
+                if ((now_ms - last_oled_ms) >= 500) {
+                    last_oled_ms = now_ms;
+                    updateOLED();
+                }
+
+                vTaskDelay(1);
+                continue;
+            }
+
+            float ecg_filtered = (float)raw;
+
+            ecg_filtered = ecg_highpass(ecg_filtered);
+            ecg_filtered = ecg_lowpass(ecg_filtered);
+            ecg_filtered = ecg_moving_average(ecg_filtered);
+
+            startTaskTimer(TASK_ECG_PROCESSING);
+            ecg_output_t ecg = ecg_processing_update((int)ecg_filtered);
+            endTaskTimer(TASK_ECG_PROCESSING);
+
+            if (ecg.bpm > 0.0f) {
+                g_bpm = smooth_bpm(ecg.bpm);
+            }
+
+            update_status_from_bpm(g_bpm);
+
+            unsigned long now_ms = millis();
+
+            if (stream_mode == STREAM_MODE_DATA) {
+                Serial.printf(
+                    "DATA,%lu,%d,%.2f,%.2f,%d,%.1f,%.2f,%s\n",
+                    now_us,
+                    raw,
+                    ecg_filtered,
+                    ecg.integrated,
+                    ecg.r_peak_detected ? 1 : 0,
+                    g_bpm,
+                    ecg.threshold,
+                    g_status
+                );
+            }
+
+            if ((now_ms - last_debug_ms) >= 2000) {
+                last_debug_ms = now_ms;
+
+                LOG(
+                    "ECG",
+                    "RAW=%d | FILT=%.1f | INT=%.1f | TH=%.1f | BPM=%.1f | STATUS=%s",
+                    raw,
+                    ecg_filtered,
+                    ecg.integrated,
+                    ecg.threshold,
+                    g_bpm,
+                    g_status
+                );
+            }
+
+            if (ecg.r_peak_detected) {
+                LOG(
+                    "RPEAK",
+                    "RR=%.3f | BPM_INST=%.1f | BPM_SMOOTH=%.1f | STATUS=%s",
+                    ecg.rr_sec,
+                    ecg.bpm,
+                    g_bpm,
+                    g_status
+                );
+            }
+
+            if ((now_ms - last_oled_ms) >= 500) {
+                last_oled_ms = now_ms;
+                updateOLED();
+            }
+        }
+
+        vTaskDelay(1);
+    }
+}
 
 void setup()
 {
     Serial.begin(BAUD_RATE);
-    delay(1000);
+    delay(1500);
 
-    LOG("BOOT", "PFE ECG starting...");
-    LOG("BOOT", "Framework Arduino");
+    pinMode(ECG_LO_PLUS_PIN, INPUT_PULLDOWN);
+    pinMode(ECG_LO_MINUS_PIN, INPUT_PULLDOWN);
 
-    ad8232_init();
+    LOG("BOOT", "=================================");
+    LOG("BOOT", "PFE ECG STARTING");
+    LOG("BOOT", "ESP32-S3 + ADS1115 + AD8232");
+    LOG("BOOT", "Default mode = LOG");
+    LOG("BOOT", "Send MODE_AI for DATA stream");
+    LOG("BOOT", "Send MODE_DOCTOR for LOG stream");
+    LOG("BOOT", "=================================");
+
+    if (!ads1115_ecg_init()) {
+        LOG("BOOT", "ADS1115 failed");
+
+        while (true) {
+            delay(1000);
+        }
+    }
+
+    oled_ok = sh1106_init(&oled, 0, 0x3C);
+
+    if (oled_ok) {
+        LOG("BOOT", "OLED initialized");
+
+        sh1106_clear(&oled);
+        sh1106_draw_text_line(&oled, 0, "PFE ECG");
+        sh1106_draw_text_line(&oled, 2, "Starting...");
+        sh1106_refresh(&oled);
+    } else {
+        LOG("BOOT", "OLED not initialized");
+    }
+
+    ecg_filter_init();
     ecg_processing_init();
 
     xTaskCreate(
@@ -24,42 +365,20 @@ void setup()
         NULL
     );
 
-    last_sample_us = micros();
+    xTaskCreate(
+        ecgTask,
+        "ecgTask",
+        ECG_TASK_STACK_SIZE,
+        NULL,
+        ECG_TASK_PRIORITY,
+        NULL
+    );
 
-    LOG("BOOT", "Sistema inicializado");
-    LOG("BOOT", "Formato: timestamp_us,raw,integrated,r_peak,bpm");
+    LOG("BOOT", "System initialized");
+    LOG("BOOT", "Sampling rate = %d Hz", SAMPLE_RATE_HZ);
 }
 
 void loop()
 {
-    startTaskTimer(TASK_MAIN_LOOP);
-
-    unsigned long now_us = micros();
-
-    if ((now_us - last_sample_us) >= SAMPLE_INTERVAL_US) {
-        last_sample_us += SAMPLE_INTERVAL_US;
-
-        startTaskTimer(TASK_AD8232_READ);
-        int raw = ad8232_read_raw();
-        endTaskTimer(TASK_AD8232_READ);
-
-        startTaskTimer(TASK_ECG_PROCESSING);
-        ecg_output_t ecg = ecg_processing_update(raw);
-        endTaskTimer(TASK_ECG_PROCESSING);
-
-        printf(
-            "%lu,%d,%.2f,%d,%.1f\n",
-            now_us,
-            raw,
-            ecg.integrated,
-            ecg.r_peak_detected ? 1 : 0,
-            ecg.bpm
-        );
-
-        if (ecg.r_peak_detected) {
-            LOG("ECG", "R_PEAK RR=%.3f BPM=%.1f", ecg.rr_sec, ecg.bpm);
-        }
-    }
-
-    endTaskTimer(TASK_MAIN_LOOP);
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
