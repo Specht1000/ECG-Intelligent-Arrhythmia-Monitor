@@ -1,0 +1,4 @@
+Direct accuracy: 0.004999
+Inferred-mapping accuracy: 0.906325
+Final accuracy used: 0.906325
+Mapping used: inferred

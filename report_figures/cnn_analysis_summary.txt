@@ -1,0 +1,32 @@
+
+REAL CNN ANALYSIS SUMMARY
+
+Dataset:
+- X file: C:\Projetos\PFE\Software\pfe_ecg\data\processed\cnn_X.npy
+- y file: C:\Projetos\PFE\Software\pfe_ecg\data\processed\cnn_y.csv
+- Label column: arrhythmia_label
+- Total samples: 23005
+- Test samples: 4601
+- Classes: [np.str_('fusion'), np.str_('normal'), np.str_('other'), np.str_('supraventricular'), np.str_('ventricular')]
+
+Model:
+- File: C:\Projetos\PFE\Software\pfe_ecg\data\processed\cnn_arrhythmia_model_final.keras
+
+Results:
+- Direct accuracy: 0.004999
+- Inferred-mapping accuracy: 0.906325
+- Final accuracy used: 0.906325
+- Mapping used: inferred
+
+Inferred mapping:
+{
+    "model_output_0": "normal",
+    "model_output_1": "supraventricular",
+    "model_output_2": "ventricular",
+    "model_output_3": "fusion",
+    "model_output_4": "other"
+}
+
+Important:
+If mapping_used is 'inferred', the class order saved in the model does not match alphabetical class order.
+This must be explained in the report.

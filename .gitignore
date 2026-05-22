@@ -31,6 +31,18 @@ tools/ecg_raw_capture.csv
 # Data
 data/
 
+# REPORTS
+reports/
+
+# CSV
+*.csv
+
+# SPECS
+*.spec
+
+# JSON
+*.json
+
 # Windows
 Thumbs.db
 desktop.ini

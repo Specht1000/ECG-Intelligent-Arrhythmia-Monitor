@@ -1,0 +1,18 @@
+\begin{table}[H]
+\centering
+\caption{CNN classification performance on the test set.}
+\label{tab:cnn_performance}
+\begin{tabular}{lcccc}
+\toprule
+Class & Precision & Recall & F1-score & Support \\
+\midrule
+fusion & 0.000 & 0.000 & 0.000 & 14 \\
+normal & 0.895 & 0.984 & 0.937 & 3147 \\
+other & 0.000 & 0.000 & 0.000 & 123 \\
+supraventricular & 0.964 & 0.509 & 0.667 & 318 \\
+ventricular & 0.937 & 0.913 & 0.925 & 999 \\
+\midrule
+Accuracy & \multicolumn{3}{c}{0.9063} & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
