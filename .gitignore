@@ -34,6 +34,10 @@ data/
 # REPORTS
 reports/
 
+# APPs
+dist/
+build/
+
 # CSV
 *.csv
 
