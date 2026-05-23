@@ -19,13 +19,22 @@ typedef enum {
     STREAM_MODE_DATA = 1
 } stream_mode_t;
 
+typedef enum {
+    DEMO_OFF = 0,
+    DEMO_NORMAL,
+    DEMO_BRADY,
+    DEMO_TACHY
+} demo_mode_t;
+
 static stream_mode_t stream_mode = STREAM_MODE_LOG;
+static demo_mode_t demo_mode = DEMO_OFF;
 
 static sh1106_t oled;
 static bool oled_ok = false;
 
 static unsigned long last_debug_ms = 0;
 static unsigned long last_oled_ms = 0;
+static unsigned long last_demo_ms = 0;
 
 static float g_bpm = 0.0f;
 static float g_bpm_smoothed = 0.0f;
@@ -170,6 +179,34 @@ static void handle_serial_commands()
             LOG("SERIAL", "Mode Doctor: LOG stream ON");
             return;
         }
+
+        if (cmd == "DEMO_TACHY") {
+            demo_mode = DEMO_TACHY;
+            reset_bpm_filter();
+            LOG("DEMO", "Demo mode: TACHYCARDIA");
+            return;
+        }
+
+        if (cmd == "DEMO_BRADY") {
+            demo_mode = DEMO_BRADY;
+            reset_bpm_filter();
+            LOG("DEMO", "Demo mode: BRADYCARDIA");
+            return;
+        }
+
+        if (cmd == "DEMO_NORMAL") {
+            demo_mode = DEMO_NORMAL;
+            reset_bpm_filter();
+            LOG("DEMO", "Demo mode: NORMAL");
+            return;
+        }
+
+        if (cmd == "DEMO_OFF") {
+            demo_mode = DEMO_OFF;
+            reset_bpm_filter();
+            LOG("DEMO", "Demo mode OFF - real ECG restored");
+            return;
+        }
     }
 }
 
@@ -193,7 +230,118 @@ static void updateOLED()
     snprintf(line, sizeof(line), "%s", g_status);
     sh1106_draw_text_line(&oled, 5, line);
 
+    if (demo_mode != DEMO_OFF) {
+        sh1106_draw_text_line(&oled, 7, "DEMO MODE");
+    }
+
     sh1106_refresh(&oled);
+}
+
+static void send_demo_sample()
+{
+    unsigned long now_ms = millis();
+    unsigned long now_us = micros();
+
+    if ((now_ms - last_demo_ms) < 120) {
+        return;
+    }
+
+    last_demo_ms = now_ms;
+
+    static int demo_index = 0;
+    demo_index++;
+
+    float bpm = 75.0f;
+    float rr = 0.800f;
+    const char *status = "NORMAL";
+
+    if (demo_mode == DEMO_TACHY) {
+        bpm = 135.0f;
+        rr = 0.444f;
+        status = "HIGH_HR";
+    } else if (demo_mode == DEMO_BRADY) {
+        bpm = 42.0f;
+        rr = 1.428f;
+        status = "LOW_HR";
+    } else if (demo_mode == DEMO_NORMAL) {
+        bpm = 75.0f;
+        rr = 0.800f;
+        status = "NORMAL";
+    }
+
+    g_bpm = bpm;
+    snprintf(g_status, sizeof(g_status), "%s", status);
+
+    float phase = (float)(demo_index % 20);
+
+    int raw = 12000;
+    float filt = 0.0f;
+
+    if (phase == 0) {
+        raw = 15000;
+        filt = 1200.0f;
+    } else if (phase == 1) {
+        raw = 21000;
+        filt = 4200.0f;
+    } else if (phase == 2) {
+        raw = 14500;
+        filt = 900.0f;
+    } else if (phase == 3) {
+        raw = 11000;
+        filt = -600.0f;
+    } else {
+        raw = 12000 + ((demo_index % 7) * 80);
+        filt = -120.0f + ((demo_index % 5) * 40.0f);
+    }
+
+    float integrated = (phase <= 2) ? 95000.0f : 18000.0f;
+    float threshold = 40000.0f;
+    int rpeak = (phase == 1) ? 1 : 0;
+
+    if (stream_mode == STREAM_MODE_DATA) {
+        Serial.printf(
+            "DATA,%lu,%d,%.2f,%.2f,%d,%.1f,%.2f,%s\n",
+            now_us,
+            raw,
+            filt,
+            integrated,
+            rpeak,
+            g_bpm,
+            threshold,
+            g_status
+        );
+    }
+
+    if ((now_ms - last_debug_ms) >= 1000) {
+        last_debug_ms = now_ms;
+
+        LOG(
+            "ECG",
+            "DEMO | RAW=%d | FILT=%.1f | INT=%.1f | TH=%.1f | BPM=%.1f | STATUS=%s",
+            raw,
+            filt,
+            integrated,
+            threshold,
+            g_bpm,
+            g_status
+        );
+    }
+
+    if (rpeak) {
+        LOG(
+            "RPEAK",
+            "DEMO | RR=%.3f | BPM_INST=%.1f | BPM_SMOOTH=%.1f | STATUS=%s",
+            rr,
+            bpm,
+            bpm,
+            status
+        );
+    }
+
+    if ((now_ms - last_oled_ms) >= 500) {
+        last_oled_ms = now_ms;
+        updateOLED();
+    }
 }
 
 static void ecgTask(void *pvParameters)
@@ -202,6 +350,12 @@ static void ecgTask(void *pvParameters)
 
     while (true) {
         handle_serial_commands();
+
+        if (demo_mode != DEMO_OFF) {
+            send_demo_sample();
+            vTaskDelay(1);
+            continue;
+        }
 
         unsigned long now_us = micros();
 
@@ -321,15 +475,16 @@ void setup()
     Serial.begin(BAUD_RATE);
     delay(1500);
 
-    pinMode(ECG_LO_PLUS_PIN, INPUT_PULLDOWN);
-    pinMode(ECG_LO_MINUS_PIN, INPUT_PULLDOWN);
+    pinMode(ECG_LO_PLUS_PIN, INPUT);
+    pinMode(ECG_LO_MINUS_PIN, INPUT);
 
     LOG("BOOT", "=================================");
     LOG("BOOT", "PFE ECG STARTING");
     LOG("BOOT", "ESP32-S3 + ADS1115 + AD8232");
+    LOG("BOOT", "MODE_DOCTOR = LOG");
+    LOG("BOOT", "MODE_AI = DATA");
+    LOG("BOOT", "DEMO_TACHY / DEMO_BRADY / DEMO_NORMAL / DEMO_OFF");
     LOG("BOOT", "Default mode = LOG");
-    LOG("BOOT", "Send MODE_AI for DATA stream");
-    LOG("BOOT", "Send MODE_DOCTOR for LOG stream");
     LOG("BOOT", "=================================");
 
     if (!ads1115_ecg_init()) {
